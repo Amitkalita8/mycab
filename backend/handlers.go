@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,7 +14,9 @@ import (
 )
 
 type Server struct {
-	db *sql.DB
+	db          *sql.DB
+	staticDir   string // built React app to serve; empty = API only
+	allowOrigin string // CORS origin; empty or "*" allows any
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -83,13 +87,38 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/rides/{id}/start", s.auth(RoleDriver, s.statusAction(StatusStarted)))
 	mux.HandleFunc("POST /api/rides/{id}/complete", s.auth(RoleDriver, s.statusAction(StatusCompleted)))
 
-	return cors(mux)
+	// unknown /api paths get JSON 404s; everything else is the React app (if configured)
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusNotFound, "not found")
+	})
+	if s.staticDir != "" {
+		mux.Handle("/", spaHandler(s.staticDir))
+	}
+
+	return s.cors(mux)
 }
 
-// cors allows the React dev server (localhost:3000) to call the API directly.
-func cors(next http.Handler) http.Handler {
+// spaHandler serves files from dir, falling back to index.html so client-side routes work.
+func spaHandler(dir string) http.Handler {
+	files := http.FileServer(http.Dir(dir))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		p := filepath.Join(dir, filepath.Clean("/"+r.URL.Path))
+		if st, err := os.Stat(p); err != nil || st.IsDir() && r.URL.Path != "/" {
+			http.ServeFile(w, r, filepath.Join(dir, "index.html"))
+			return
+		}
+		files.ServeHTTP(w, r)
+	})
+}
+
+// cors lets a separately hosted frontend call the API. Not needed when the Go server serves the frontend.
+func (s *Server) cors(next http.Handler) http.Handler {
+	origin := s.allowOrigin
+	if origin == "" {
+		origin = "*"
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {

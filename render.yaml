@@ -1,0 +1,11 @@
+# Render Blueprint: one free web service running the Go API + built React app.
+services:
+  - type: web
+    name: mycab
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL   # libsql://<db>.turso.io?authToken=<token>  (set in the Render dashboard)
+        sync: false

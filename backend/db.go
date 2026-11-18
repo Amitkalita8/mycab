@@ -2,8 +2,10 @@ package main
 
 import (
 	"database/sql"
+	"strings"
 
-	_ "modernc.org/sqlite" // pure-Go SQLite driver (no cgo / gcc needed)
+	_ "github.com/tursodatabase/libsql-client-go/libsql" // hosted Turso database (pure Go)
+	_ "modernc.org/sqlite"                               // local SQLite file (pure Go, no cgo / gcc needed)
 )
 
 const schema = `
@@ -64,17 +66,30 @@ CREATE INDEX IF NOT EXISTS idx_rides_driver ON rides(driver_id);
 CREATE INDEX IF NOT EXISTS idx_rides_status ON rides(status);
 `
 
-func openDB(path string) (*sql.DB, error) {
-	// busy_timeout + WAL avoid "database is locked" under concurrent requests.
-	dsn := "file:" + path + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
-	db, err := sql.Open("sqlite", dsn)
+// openDB opens the database. If target is a libsql:// (Turso) URL it connects to that hosted
+// database, otherwise target is treated as a local SQLite file path.
+func openDB(target string) (*sql.DB, error) {
+	var db *sql.DB
+	var err error
+	if strings.HasPrefix(target, "libsql://") || strings.HasPrefix(target, "https://") {
+		db, err = sql.Open("libsql", target)
+	} else {
+		// busy_timeout + WAL avoid "database is locked" under concurrent requests.
+		db, err = sql.Open("sqlite", "file:"+target+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	}
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1) // SQLite: single writer; also makes each request's transaction serial
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, err
+	db.SetMaxOpenConns(1) // single writer; also makes each request's transaction serial
+	// Run statements one at a time: remote drivers don't all accept multi-statement Exec.
+	for _, stmt := range strings.Split(schema, ";") {
+		if strings.TrimSpace(stmt) == "" {
+			continue
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	return db, nil
 }

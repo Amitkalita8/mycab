@@ -1,0 +1,7 @@
+.git
+**/node_modules
+frontend/build
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.exe

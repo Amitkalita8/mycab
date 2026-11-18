@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Server struct {
@@ -51,32 +53,45 @@ func (s *Server) routes() http.Handler {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	})
 
-	mux.HandleFunc("POST /api/users", s.createUser)
-	mux.HandleFunc("GET /api/users/{id}", s.getUser)
+	// auth
+	mux.HandleFunc("POST /api/auth/register/rider", s.registerRider)
+	mux.HandleFunc("POST /api/auth/register/driver", s.registerDriver)
+	mux.HandleFunc("POST /api/auth/login", s.login)
+	mux.HandleFunc("POST /api/auth/logout", s.auth("", s.logout))
+	mux.HandleFunc("GET /api/me", s.auth("", s.me))
 
-	mux.HandleFunc("POST /api/drivers", s.createDriver)
-	mux.HandleFunc("GET /api/drivers", s.listDrivers)
-	mux.HandleFunc("GET /api/drivers/{id}", s.getDriver)
-	mux.HandleFunc("PATCH /api/drivers/{id}/availability", s.setAvailability)
-
+	// public
 	mux.HandleFunc("POST /api/fare-estimate", s.fareEstimate)
-	mux.HandleFunc("POST /api/rides", s.createRide)
-	mux.HandleFunc("GET /api/rides", s.listRides)
-	mux.HandleFunc("GET /api/rides/{id}", s.getRide)
-	mux.HandleFunc("POST /api/rides/{id}/accept", s.acceptRide)
-	mux.HandleFunc("POST /api/rides/{id}/start", s.statusAction(StatusStarted))
-	mux.HandleFunc("POST /api/rides/{id}/complete", s.statusAction(StatusCompleted))
-	mux.HandleFunc("POST /api/rides/{id}/cancel", s.statusAction(StatusCancelled))
+
+	// driver
+	mux.HandleFunc("PATCH /api/driver/availability", s.auth(RoleDriver, s.setAvailability))
+	mux.HandleFunc("PUT /api/driver/location", s.auth(RoleDriver, s.updateLocation))
+
+	// rider
+	mux.HandleFunc("GET /api/drivers/nearby", s.auth(RoleRider, s.nearbyDrivers))
+	mux.HandleFunc("POST /api/rides", s.auth(RoleRider, s.createRide))
+	mux.HandleFunc("POST /api/rides/{id}/pay", s.auth(RoleRider, s.payRide))
+	mux.HandleFunc("POST /api/rides/{id}/rate", s.auth(RoleRider, s.rateRide))
+
+	// shared (scoped to the caller inside)
+	mux.HandleFunc("GET /api/rides", s.auth("", s.listRides))
+	mux.HandleFunc("GET /api/rides/{id}", s.auth("", s.getRide))
+	mux.HandleFunc("POST /api/rides/{id}/cancel", s.auth("", s.statusAction(StatusCancelled)))
+
+	// driver ride actions
+	mux.HandleFunc("POST /api/rides/{id}/accept", s.auth(RoleDriver, s.acceptRide))
+	mux.HandleFunc("POST /api/rides/{id}/start", s.auth(RoleDriver, s.statusAction(StatusStarted)))
+	mux.HandleFunc("POST /api/rides/{id}/complete", s.auth(RoleDriver, s.statusAction(StatusCompleted)))
 
 	return cors(mux)
 }
 
-// cors allows the React dev server (localhost:3000) to call the API.
+// cors allows the React dev server (localhost:3000) to call the API directly.
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -85,30 +100,7 @@ func cors(next http.Handler) http.Handler {
 	})
 }
 
-// ---------- Users ----------
-
-func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Name, Phone string }
-	if !decode(w, r, &in) {
-		return
-	}
-	in.Name, in.Phone = strings.TrimSpace(in.Name), strings.TrimSpace(in.Phone)
-	if in.Name == "" || in.Phone == "" {
-		writeErr(w, 400, "name and phone are required")
-		return
-	}
-	res, err := s.db.Exec(`INSERT INTO users(name, phone) VALUES(?, ?)`, in.Name, in.Phone)
-	if isUnique(err) {
-		writeErr(w, 409, "phone already registered")
-		return
-	} else if err != nil {
-		writeErr(w, 500, "could not create user")
-		return
-	}
-	id, _ := res.LastInsertId()
-	u, _ := s.fetchUser(id)
-	writeJSON(w, 201, u)
-}
+// ---------- Accounts ----------
 
 func (s *Server) fetchUser(id int64) (*User, error) {
 	var u User
@@ -117,106 +109,26 @@ func (s *Server) fetchUser(id int64) (*User, error) {
 	return &u, err
 }
 
-func (s *Server) getUser(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
-	}
-	u, err := s.fetchUser(id)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeErr(w, 404, "user not found")
-		return
-	} else if err != nil {
-		writeErr(w, 500, "database error")
-		return
-	}
-	writeJSON(w, 200, u)
+const driverCols = `id, name, phone, vehicle_model, vehicle_plate, available, lat, lng, location_updated_at,
+	CASE WHEN rating_count > 0 THEN rating_sum * 1.0 / rating_count END, rating_count, created_at`
+
+func (s *Server) fetchDriver(id int64) (*Driver, error) {
+	var d Driver
+	err := s.db.QueryRow(`SELECT `+driverCols+` FROM drivers WHERE id = ?`, id).
+		Scan(&d.ID, &d.Name, &d.Phone, &d.VehicleModel, &d.VehiclePlate, &d.Available,
+			&d.Lat, &d.Lng, &d.LocationUpdatedAt, &d.Rating, &d.RatingCount, &d.CreatedAt)
+	return &d, err
 }
 
 // ---------- Drivers ----------
 
-const driverCols = `id, name, phone, vehicle_model, vehicle_plate, available, created_at`
-
-func scanDriver(sc interface{ Scan(...any) error }) (*Driver, error) {
-	var d Driver
-	err := sc.Scan(&d.ID, &d.Name, &d.Phone, &d.VehicleModel, &d.VehiclePlate, &d.Available, &d.CreatedAt)
-	return &d, err
+func (s *Server) hasActiveRide(col string, id int64) (bool, error) { // col is a fixed literal
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM rides WHERE `+col+` = ? AND status IN ('requested','accepted','started')`, id).Scan(&n)
+	return n > 0, err
 }
 
-func (s *Server) createDriver(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Name         string `json:"name"`
-		Phone        string `json:"phone"`
-		VehicleModel string `json:"vehicle_model"`
-		VehiclePlate string `json:"vehicle_plate"`
-	}
-	if !decode(w, r, &in) {
-		return
-	}
-	if strings.TrimSpace(in.Name) == "" || strings.TrimSpace(in.Phone) == "" ||
-		strings.TrimSpace(in.VehicleModel) == "" || strings.TrimSpace(in.VehiclePlate) == "" {
-		writeErr(w, 400, "name, phone, vehicle_model and vehicle_plate are required")
-		return
-	}
-	res, err := s.db.Exec(
-		`INSERT INTO drivers(name, phone, vehicle_model, vehicle_plate) VALUES(?,?,?,?)`,
-		in.Name, in.Phone, in.VehicleModel, in.VehiclePlate)
-	if isUnique(err) {
-		writeErr(w, 409, "phone or vehicle plate already registered")
-		return
-	} else if err != nil {
-		writeErr(w, 500, "could not create driver")
-		return
-	}
-	id, _ := res.LastInsertId()
-	d, _ := scanDriver(s.db.QueryRow(`SELECT `+driverCols+` FROM drivers WHERE id = ?`, id))
-	writeJSON(w, 201, d)
-}
-
-func (s *Server) listDrivers(w http.ResponseWriter, r *http.Request) {
-	q := `SELECT ` + driverCols + ` FROM drivers`
-	if r.URL.Query().Get("available") == "true" {
-		q += ` WHERE available = 1`
-	}
-	rows, err := s.db.Query(q + ` ORDER BY id`)
-	if err != nil {
-		writeErr(w, 500, "database error")
-		return
-	}
-	defer rows.Close()
-	out := []*Driver{}
-	for rows.Next() {
-		d, err := scanDriver(rows)
-		if err != nil {
-			writeErr(w, 500, "database error")
-			return
-		}
-		out = append(out, d)
-	}
-	writeJSON(w, 200, out)
-}
-
-func (s *Server) getDriver(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
-	}
-	d, err := scanDriver(s.db.QueryRow(`SELECT `+driverCols+` FROM drivers WHERE id = ?`, id))
-	if errors.Is(err, sql.ErrNoRows) {
-		writeErr(w, 404, "driver not found")
-		return
-	} else if err != nil {
-		writeErr(w, 500, "database error")
-		return
-	}
-	writeJSON(w, 200, d)
-}
-
-func (s *Server) setAvailability(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
-	}
+func (s *Server) setAvailability(w http.ResponseWriter, r *http.Request, a Actor) {
 	var in struct {
 		Available *bool `json:"available"`
 	}
@@ -227,28 +139,131 @@ func (s *Server) setAvailability(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "available is required")
 		return
 	}
-	res, err := s.db.Exec(`UPDATE drivers SET available = ? WHERE id = ?`, *in.Available, id)
+	if *in.Available {
+		busy, err := s.hasActiveRide("driver_id", a.ID)
+		if err != nil {
+			writeErr(w, 500, "database error")
+			return
+		}
+		if busy {
+			writeErr(w, 409, "finish your current ride first")
+			return
+		}
+	}
+	if _, err := s.db.Exec(`UPDATE drivers SET available = ? WHERE id = ?`, *in.Available, a.ID); err != nil {
+		writeErr(w, 500, "database error")
+		return
+	}
+	d, _ := s.fetchDriver(a.ID)
+	writeJSON(w, 200, d)
+}
+
+func validLatLng(lat, lng float64) bool {
+	return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180
+}
+
+func (s *Server) updateLocation(w http.ResponseWriter, r *http.Request, a Actor) {
+	var in struct{ Lat, Lng *float64 }
+	if !decode(w, r, &in) {
+		return
+	}
+	if in.Lat == nil || in.Lng == nil || !validLatLng(*in.Lat, *in.Lng) {
+		writeErr(w, 400, "valid lat and lng are required")
+		return
+	}
+	if _, err := s.db.Exec(`UPDATE drivers SET lat = ?, lng = ?, location_updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		*in.Lat, *in.Lng, a.ID); err != nil {
+		writeErr(w, 500, "database error")
+		return
+	}
+	d, _ := s.fetchDriver(a.ID)
+	writeJSON(w, 200, d)
+}
+
+// nearbyDrivers lists available drivers with a recent (<10 min) location within radius_km.
+func (s *Server) nearbyDrivers(w http.ResponseWriter, r *http.Request, _ Actor) {
+	q := r.URL.Query()
+	lat, err1 := strconv.ParseFloat(q.Get("lat"), 64)
+	lng, err2 := strconv.ParseFloat(q.Get("lng"), 64)
+	if err1 != nil || err2 != nil || !validLatLng(lat, lng) {
+		writeErr(w, 400, "valid lat and lng query params are required")
+		return
+	}
+	radius := 5.0
+	if v, err := strconv.ParseFloat(q.Get("radius_km"), 64); err == nil && v > 0 && v <= 50 {
+		radius = v
+	}
+	rows, err := s.db.Query(`SELECT id, name, vehicle_model, vehicle_plate, lat, lng,
+		CASE WHEN rating_count > 0 THEN rating_sum * 1.0 / rating_count END
+		FROM drivers WHERE available = 1 AND lat IS NOT NULL AND lng IS NOT NULL
+		AND CAST(strftime('%s', location_updated_at) AS INTEGER) >= ?`, time.Now().Add(-10*time.Minute).Unix())
 	if err != nil {
 		writeErr(w, 500, "database error")
 		return
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		writeErr(w, 404, "driver not found")
-		return
+	defer rows.Close()
+	out := []NearbyDriver{}
+	for rows.Next() {
+		var d NearbyDriver
+		if err := rows.Scan(&d.ID, &d.Name, &d.VehicleModel, &d.VehiclePlate, &d.Lat, &d.Lng, &d.Rating); err != nil {
+			writeErr(w, 500, "database error")
+			return
+		}
+		d.DistanceKm = haversineKm(lat, lng, d.Lat, d.Lng)
+		if d.DistanceKm <= radius {
+			out = append(out, d)
+		}
 	}
-	s.getDriver(w, r)
+	sort.Slice(out, func(i, j int) bool { return out[i].DistanceKm < out[j].DistanceKm })
+	if len(out) > 20 {
+		out = out[:20]
+	}
+	writeJSON(w, 200, out)
 }
 
 // ---------- Rides ----------
 
-const rideCols = `id, user_id, driver_id, pickup, dropoff, pickup_lat, pickup_lng,
-	dropoff_lat, dropoff_lng, distance_km, fare, status, created_at, updated_at`
+const rideSelect = `SELECT r.id, r.user_id, u.name, r.driver_id, d.name, d.vehicle_model, d.vehicle_plate, d.phone,
+	d.lat, d.lng, r.pickup, r.dropoff, r.pickup_lat, r.pickup_lng, r.dropoff_lat, r.dropoff_lng,
+	r.distance_km, r.fare, r.status, r.payment_method, r.payment_status, r.rating, r.review, r.created_at, r.updated_at
+	FROM rides r JOIN users u ON u.id = r.user_id LEFT JOIN drivers d ON d.id = r.driver_id`
 
 func scanRide(sc interface{ Scan(...any) error }) (*Ride, error) {
 	var x Ride
-	err := sc.Scan(&x.ID, &x.UserID, &x.DriverID, &x.Pickup, &x.Dropoff, &x.PickupLat, &x.PickupLng,
-		&x.DropoffLat, &x.DropoffLng, &x.DistanceKm, &x.Fare, &x.Status, &x.CreatedAt, &x.UpdatedAt)
+	err := sc.Scan(&x.ID, &x.UserID, &x.RiderName, &x.DriverID, &x.DriverName, &x.DriverVehicle, &x.DriverPlate,
+		&x.DriverPhone, &x.DriverLat, &x.DriverLng, &x.Pickup, &x.Dropoff, &x.PickupLat, &x.PickupLng,
+		&x.DropoffLat, &x.DropoffLng, &x.DistanceKm, &x.Fare, &x.Status, &x.PaymentMethod, &x.PaymentStatus,
+		&x.Rating, &x.Review, &x.CreatedAt, &x.UpdatedAt)
 	return &x, err
+}
+
+func (s *Server) loadRide(id int64) (*Ride, error) {
+	return scanRide(s.db.QueryRow(rideSelect+` WHERE r.id = ?`, id))
+}
+
+// canView: a rider sees their own rides; a driver sees rides assigned to them and open requests.
+func canView(a Actor, x *Ride) bool {
+	if a.Role == RoleRider {
+		return x.UserID == a.ID
+	}
+	return x.Status == StatusRequested || (x.DriverID != nil && *x.DriverID == a.ID)
+}
+
+// ride loads the ride from the path and enforces visibility. Not-visible is reported as 404.
+func (s *Server) ride(w http.ResponseWriter, r *http.Request, a Actor) (*Ride, bool) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return nil, false
+	}
+	x, err := s.loadRide(id)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !canView(a, x)) {
+		writeErr(w, 404, "ride not found")
+		return nil, false
+	} else if err != nil {
+		writeErr(w, 500, "database error")
+		return nil, false
+	}
+	return x, true
 }
 
 type coords struct {
@@ -259,8 +274,7 @@ type coords struct {
 }
 
 func (c coords) valid() bool {
-	ok := func(lat, lng float64) bool { return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180 }
-	return ok(c.PickupLat, c.PickupLng) && ok(c.DropoffLat, c.DropoffLng)
+	return validLatLng(c.PickupLat, c.PickupLng) && validLatLng(c.DropoffLat, c.DropoffLng)
 }
 
 func (s *Server) fareEstimate(w http.ResponseWriter, r *http.Request) {
@@ -276,52 +290,71 @@ func (s *Server) fareEstimate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]float64{"distance_km": km, "fare": calcFare(km)})
 }
 
-func (s *Server) createRide(w http.ResponseWriter, r *http.Request) {
+func (s *Server) createRide(w http.ResponseWriter, r *http.Request, a Actor) {
 	var in struct {
-		UserID  int64  `json:"user_id"`
-		Pickup  string `json:"pickup"`
-		Dropoff string `json:"dropoff"`
+		Pickup        string `json:"pickup"`
+		Dropoff       string `json:"dropoff"`
+		PaymentMethod string `json:"payment_method"`
 		coords
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	if in.UserID <= 0 || strings.TrimSpace(in.Pickup) == "" || strings.TrimSpace(in.Dropoff) == "" {
-		writeErr(w, 400, "user_id, pickup and dropoff are required")
+	if strings.TrimSpace(in.Pickup) == "" || strings.TrimSpace(in.Dropoff) == "" {
+		writeErr(w, 400, "pickup and dropoff are required")
 		return
 	}
 	if !in.valid() {
 		writeErr(w, 400, "invalid coordinates")
 		return
 	}
-	if _, err := s.fetchUser(in.UserID); errors.Is(err, sql.ErrNoRows) {
-		writeErr(w, 404, "user not found")
+	if in.PaymentMethod == "" {
+		in.PaymentMethod = "cash"
+	}
+	if !paymentMethods[in.PaymentMethod] {
+		writeErr(w, 400, "payment_method must be cash, card or wallet")
+		return
+	}
+	if busy, err := s.hasActiveRide("user_id", a.ID); err != nil {
+		writeErr(w, 500, "database error")
+		return
+	} else if busy {
+		writeErr(w, 409, "you already have an active ride")
 		return
 	}
 	km := haversineKm(in.PickupLat, in.PickupLng, in.DropoffLat, in.DropoffLng)
 	res, err := s.db.Exec(`INSERT INTO rides(user_id, pickup, dropoff, pickup_lat, pickup_lng,
-		dropoff_lat, dropoff_lng, distance_km, fare) VALUES(?,?,?,?,?,?,?,?,?)`,
-		in.UserID, in.Pickup, in.Dropoff, in.PickupLat, in.PickupLng,
-		in.DropoffLat, in.DropoffLng, km, calcFare(km))
+		dropoff_lat, dropoff_lng, distance_km, fare, payment_method) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, in.Pickup, in.Dropoff, in.PickupLat, in.PickupLng,
+		in.DropoffLat, in.DropoffLng, km, calcFare(km), in.PaymentMethod)
 	if err != nil {
 		writeErr(w, 500, "could not create ride")
 		return
 	}
 	id, _ := res.LastInsertId()
-	ride, _ := scanRide(s.db.QueryRow(`SELECT `+rideCols+` FROM rides WHERE id = ?`, id))
+	ride, _ := s.loadRide(id)
 	writeJSON(w, 201, ride)
 }
 
-func (s *Server) listRides(w http.ResponseWriter, r *http.Request) {
-	q := `SELECT ` + rideCols + ` FROM rides WHERE 1=1`
+// listRides returns the caller's own rides. Drivers can pass scope=open to see unassigned requests.
+func (s *Server) listRides(w http.ResponseWriter, r *http.Request, a Actor) {
+	q := rideSelect + ` WHERE `
 	var args []any
-	for _, f := range []string{"user_id", "driver_id", "status"} {
-		if v := r.URL.Query().Get(f); v != "" {
-			q += ` AND ` + f + ` = ?` // f comes from a fixed list, not user input
-			args = append(args, v)
-		}
+	switch {
+	case a.Role == RoleDriver && r.URL.Query().Get("scope") == "open":
+		q += `r.status = 'requested'`
+	case a.Role == RoleDriver:
+		q += `r.driver_id = ?`
+		args = append(args, a.ID)
+	default:
+		q += `r.user_id = ?`
+		args = append(args, a.ID)
 	}
-	rows, err := s.db.Query(q+` ORDER BY id DESC`, args...)
+	if st := r.URL.Query().Get("status"); st != "" {
+		q += ` AND r.status = ?`
+		args = append(args, st)
+	}
+	rows, err := s.db.Query(q+` ORDER BY r.id DESC LIMIT 100`, args...)
 	if err != nil {
 		writeErr(w, 500, "database error")
 		return
@@ -339,32 +372,16 @@ func (s *Server) listRides(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-func (s *Server) getRide(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
+func (s *Server) getRide(w http.ResponseWriter, r *http.Request, a Actor) {
+	if x, ok := s.ride(w, r, a); ok {
+		writeJSON(w, 200, x)
 	}
-	x, err := scanRide(s.db.QueryRow(`SELECT `+rideCols+` FROM rides WHERE id = ?`, id))
-	if errors.Is(err, sql.ErrNoRows) {
-		writeErr(w, 404, "ride not found")
-		return
-	} else if err != nil {
-		writeErr(w, 500, "database error")
-		return
-	}
-	writeJSON(w, 200, x)
 }
 
-// acceptRide assigns an available driver to a requested ride, atomically.
-func (s *Server) acceptRide(w http.ResponseWriter, r *http.Request) {
+// acceptRide assigns the calling driver to a requested ride, atomically.
+func (s *Server) acceptRide(w http.ResponseWriter, r *http.Request, a Actor) {
 	id, ok := pathID(w, r)
 	if !ok {
-		return
-	}
-	var in struct {
-		DriverID int64 `json:"driver_id"`
-	}
-	if !decode(w, r, &in) {
 		return
 	}
 	tx, err := s.db.Begin()
@@ -386,17 +403,17 @@ func (s *Server) acceptRide(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "ride cannot be accepted from status "+status)
 		return
 	}
-	res, err := tx.Exec(`UPDATE drivers SET available = 0 WHERE id = ? AND available = 1`, in.DriverID)
+	res, err := tx.Exec(`UPDATE drivers SET available = 0 WHERE id = ? AND available = 1`, a.ID)
 	if err != nil {
 		writeErr(w, 500, "database error")
 		return
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		writeErr(w, 409, "driver not found or not available")
+		writeErr(w, 409, "go online (available) before accepting rides")
 		return
 	}
 	if _, err := tx.Exec(`UPDATE rides SET driver_id = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		in.DriverID, StatusAccepted, id); err != nil {
+		a.ID, StatusAccepted, id); err != nil {
 		writeErr(w, 500, "database error")
 		return
 	}
@@ -404,14 +421,23 @@ func (s *Server) acceptRide(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "database error")
 		return
 	}
-	s.getRide(w, r)
+	x, _ := s.loadRide(id)
+	writeJSON(w, 200, x)
 }
 
-// statusAction moves a ride to the target status, freeing the driver when the ride ends.
-func (s *Server) statusAction(target string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := pathID(w, r)
+// statusAction moves a ride to the target status, enforcing who may do it and
+// freeing the driver when the ride ends.
+func (s *Server) statusAction(target string) func(http.ResponseWriter, *http.Request, Actor) {
+	return func(w http.ResponseWriter, r *http.Request, a Actor) {
+		x, ok := s.ride(w, r, a)
 		if !ok {
+			return
+		}
+		// start/complete: assigned driver only. cancel: the rider, or the assigned driver.
+		isOwnerRider := a.Role == RoleRider && x.UserID == a.ID
+		isAssigned := a.Role == RoleDriver && x.DriverID != nil && *x.DriverID == a.ID
+		if !isOwnerRider && !isAssigned {
+			writeErr(w, 403, "you are not allowed to do this on this ride")
 			return
 		}
 		tx, err := s.db.Begin()
@@ -421,12 +447,10 @@ func (s *Server) statusAction(target string) http.HandlerFunc {
 		}
 		defer tx.Rollback()
 
+		// re-read status inside the transaction to avoid racing another request
 		var status string
 		var driverID *int64
-		if err := tx.QueryRow(`SELECT status, driver_id FROM rides WHERE id = ?`, id).Scan(&status, &driverID); errors.Is(err, sql.ErrNoRows) {
-			writeErr(w, 404, "ride not found")
-			return
-		} else if err != nil {
+		if err := tx.QueryRow(`SELECT status, driver_id FROM rides WHERE id = ?`, x.ID).Scan(&status, &driverID); err != nil {
 			writeErr(w, 500, "database error")
 			return
 		}
@@ -434,7 +458,7 @@ func (s *Server) statusAction(target string) http.HandlerFunc {
 			writeErr(w, 409, "cannot move ride from "+status+" to "+target)
 			return
 		}
-		if _, err := tx.Exec(`UPDATE rides SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, target, id); err != nil {
+		if _, err := tx.Exec(`UPDATE rides SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, target, x.ID); err != nil {
 			writeErr(w, 500, "database error")
 			return
 		}
@@ -448,6 +472,100 @@ func (s *Server) statusAction(target string) http.HandlerFunc {
 			writeErr(w, 500, "database error")
 			return
 		}
-		s.getRide(w, r)
+		x, _ = s.loadRide(x.ID)
+		writeJSON(w, 200, x)
 	}
+}
+
+// ---------- Payments (simulated: records the payment, no real gateway) ----------
+
+func (s *Server) payRide(w http.ResponseWriter, r *http.Request, a Actor) {
+	x, ok := s.ride(w, r, a)
+	if !ok {
+		return
+	}
+	var in struct {
+		Method string `json:"method"`
+	}
+	if r.ContentLength != 0 && !decode(w, r, &in) {
+		return
+	}
+	if in.Method == "" {
+		in.Method = x.PaymentMethod
+	}
+	if !paymentMethods[in.Method] {
+		writeErr(w, 400, "method must be cash, card or wallet")
+		return
+	}
+	if x.Status != StatusCompleted {
+		writeErr(w, 409, "only completed rides can be paid")
+		return
+	}
+	res, err := s.db.Exec(`UPDATE rides SET payment_method = ?, payment_status = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND payment_status = ?`, in.Method, PayPaid, x.ID, PayPending)
+	if err != nil {
+		writeErr(w, 500, "database error")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 409, "ride is already paid")
+		return
+	}
+	x, _ = s.loadRide(x.ID)
+	writeJSON(w, 200, x)
+}
+
+// ---------- Ratings ----------
+
+func (s *Server) rateRide(w http.ResponseWriter, r *http.Request, a Actor) {
+	x, ok := s.ride(w, r, a)
+	if !ok {
+		return
+	}
+	var in struct {
+		Rating int    `json:"rating"`
+		Review string `json:"review"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if in.Rating < 1 || in.Rating > 5 {
+		writeErr(w, 400, "rating must be between 1 and 5")
+		return
+	}
+	if len(in.Review) > 500 {
+		writeErr(w, 400, "review is limited to 500 characters")
+		return
+	}
+	if x.Status != StatusCompleted || x.DriverID == nil {
+		writeErr(w, 409, "only completed rides can be rated")
+		return
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		writeErr(w, 500, "database error")
+		return
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE rides SET rating = ?, review = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND rating IS NULL`, in.Rating, in.Review, x.ID)
+	if err != nil {
+		writeErr(w, 500, "database error")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		writeErr(w, 409, "ride is already rated")
+		return
+	}
+	if _, err := tx.Exec(`UPDATE drivers SET rating_sum = rating_sum + ?, rating_count = rating_count + 1 WHERE id = ?`,
+		in.Rating, *x.DriverID); err != nil {
+		writeErr(w, 500, "database error")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeErr(w, 500, "database error")
+		return
+	}
+	x, _ = s.loadRide(x.ID)
+	writeJSON(w, 200, x)
 }

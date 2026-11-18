@@ -13,39 +13,75 @@ type User struct {
 }
 
 type Driver struct {
-	ID           int64     `json:"id"`
-	Name         string    `json:"name"`
-	Phone        string    `json:"phone"`
-	VehicleModel string    `json:"vehicle_model"`
-	VehiclePlate string    `json:"vehicle_plate"`
-	Available    bool      `json:"available"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID                int64      `json:"id"`
+	Name              string     `json:"name"`
+	Phone             string     `json:"phone"`
+	VehicleModel      string     `json:"vehicle_model"`
+	VehiclePlate      string     `json:"vehicle_plate"`
+	Available         bool       `json:"available"`
+	Lat               *float64   `json:"lat"`
+	Lng               *float64   `json:"lng"`
+	LocationUpdatedAt *time.Time `json:"location_updated_at"`
+	Rating            *float64   `json:"rating"` // average, null until rated
+	RatingCount       int        `json:"rating_count"`
+	CreatedAt         time.Time  `json:"created_at"`
+}
+
+// NearbyDriver is the limited public view of a driver shown to riders.
+type NearbyDriver struct {
+	ID           int64    `json:"id"`
+	Name         string   `json:"name"`
+	VehicleModel string   `json:"vehicle_model"`
+	VehiclePlate string   `json:"vehicle_plate"`
+	Lat          float64  `json:"lat"`
+	Lng          float64  `json:"lng"`
+	Rating       *float64 `json:"rating"`
+	DistanceKm   float64  `json:"distance_km"`
 }
 
 type Ride struct {
-	ID         int64     `json:"id"`
-	UserID     int64     `json:"user_id"`
-	DriverID   *int64    `json:"driver_id"`
-	Pickup     string    `json:"pickup"`
-	Dropoff    string    `json:"dropoff"`
-	PickupLat  float64   `json:"pickup_lat"`
-	PickupLng  float64   `json:"pickup_lng"`
-	DropoffLat float64   `json:"dropoff_lat"`
-	DropoffLng float64   `json:"dropoff_lng"`
-	DistanceKm float64   `json:"distance_km"`
-	Fare       float64   `json:"fare"`
-	Status     string    `json:"status"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID            int64     `json:"id"`
+	UserID        int64     `json:"user_id"`
+	RiderName     string    `json:"rider_name"`
+	DriverID      *int64    `json:"driver_id"`
+	DriverName    *string   `json:"driver_name"`
+	DriverVehicle *string   `json:"driver_vehicle"`
+	DriverPlate   *string   `json:"driver_plate"`
+	DriverPhone   *string   `json:"driver_phone"`
+	DriverLat     *float64  `json:"driver_lat"` // live location, for tracking
+	DriverLng     *float64  `json:"driver_lng"`
+	Pickup        string    `json:"pickup"`
+	Dropoff       string    `json:"dropoff"`
+	PickupLat     float64   `json:"pickup_lat"`
+	PickupLng     float64   `json:"pickup_lng"`
+	DropoffLat    float64   `json:"dropoff_lat"`
+	DropoffLng    float64   `json:"dropoff_lng"`
+	DistanceKm    float64   `json:"distance_km"`
+	Fare          float64   `json:"fare"`
+	Status        string    `json:"status"`
+	PaymentMethod string    `json:"payment_method"`
+	PaymentStatus string    `json:"payment_status"`
+	Rating        *int      `json:"rating"`
+	Review        *string   `json:"review"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 const (
+	RoleRider  = "rider"
+	RoleDriver = "driver"
+
 	StatusRequested = "requested"
 	StatusAccepted  = "accepted"
 	StatusStarted   = "started"
 	StatusCompleted = "completed"
 	StatusCancelled = "cancelled"
+
+	PayPending = "pending"
+	PayPaid    = "paid"
 )
+
+var paymentMethods = map[string]bool{"cash": true, "card": true, "wallet": true}
 
 // Allowed status transitions.
 var transitions = map[string][]string{
